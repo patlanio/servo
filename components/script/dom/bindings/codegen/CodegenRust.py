@@ -435,6 +435,7 @@ class CGMethodCall(CGThing):
                     # large enough that we can examine this argument.
                     info = getJSToNativeConversionInfo(
                         type, descriptor, failureCode="break;", isDefinitelyObject=True)
+                    assert not info.needsRooting
                     template = info.template
                     declType = info.declType
 
@@ -562,24 +563,30 @@ class JSToNativeConversionInfo():
     """
     An object representing information about a JS-to-native conversion.
     """
-    def __init__(self, template, default=None, declType=None):
+    def __init__(self, template, default=None, declType=None,
+                 needsRooting=False):
         """
         template: A string representing the conversion code.  This will have
                   template substitution performed on it as follows:
 
           ${val} is a handle to the JS::Value in question
+          ${root} is the name of a `Rooted` on the stack, if `needsRooting` is true.
 
         default: A string or None representing rust code for default value(if any).
 
         declType: A CGThing representing the native C++ type we're converting
                   to.  This is allowed to be None if the conversion code is
                   supposed to be used as-is.
+
+        needsRooting: A boolean indicating whether the caller needs to provide
+                      a `Rooted` on the stack.
         """
         assert isinstance(template, str)
         assert declType is None or isinstance(declType, CGThing)
         self.template = template
         self.default = default
         self.declType = declType
+        self.needsRooting = needsRooting
 
 
 def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
@@ -729,6 +736,7 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
         innerInfo = getJSToNativeConversionInfo(innerContainerType(type),
                                                 descriptorProvider,
                                                 isMember=isMember)
+        assert not innerInfo.needsRooting
         declType = wrapInNativeContainerType(type, innerInfo.declType)
         config = getConversionConfigForType(type, isEnforceRange, isClamp, treatNullAs)
 
@@ -862,7 +870,33 @@ def getJSToNativeConversionInfo(type, descriptorProvider, failureCode=None,
         return handleOptional(templateBody, declType, handleDefaultNull("None"))
 
     if type.isSpiderMonkeyInterface():
-        raise TypeError("Can't handle SpiderMonkey interface arguments yet")
+        assert not isEnforceRange
+        assert not isClamp
+        assert not defaultValue
+        assert type.isArrayBuffer()
+        templateBody = fill(
+            """
+            {
+                let x = ::js::typedarray::ArrayBuffer::from(cx, &mut $${root}, $${val}.get().to_object());
+                match x {
+                    Ok(x) => x,
+                    Err(()) => {
+                        let error = "Object was not a typed array";
+                        ${failure}
+                    }
+                }
+            }
+            """,
+            failure=failOrPropagate)
+
+        declType = CGGeneric("::js::typedarray::ArrayBuffer")
+        if type.nullable():
+            templateBody = "Some(%s)" % templateBody
+            declType = CGWrapper(declType, pre="Option<", post=">")
+        templateBody = wrapObjectTemplate(templateBody, "None",
+                                          isDefinitelyObject, type, failureCode)
+        default = None
+        return JSToNativeConversionInfo(templateBody, default, declType, needsRooting=True)
 
     if type.isDOMString():
         nullBehavior = getConversionConfigForType(type, isEnforceRange, isClamp, treatNullAs)
@@ -1246,10 +1280,19 @@ class CGArgumentConverter(CGThing):
             else:
                 assert not default
 
-            self.converter = instantiateJSToNativeConversionTemplate(
-                template, replacementVariables, declType, "arg%d" % index)
+            self.converter = CGList([], "\n")
+
+            if info.needsRooting:
+                name = "__root%d" % index
+                root = "let mut {root} = ::js::jsapi::Rooted::new_unrooted();".format(root=name)
+                replacementVariables["root"] = name
+                self.converter.append(CGGeneric(root))
+
+            self.converter.append(instantiateJSToNativeConversionTemplate(
+                template, replacementVariables, declType, "arg%d" % index))
         else:
             assert argument.optional
+            assert not info.needsRooting
             variadicConversion = {
                 "val": string.Template("${args}.get(variadicArg)").substitute(replacer),
             }
@@ -4054,6 +4097,7 @@ def getUnionTypeTemplateVars(type, descriptorProvider):
         type, descriptorProvider, failureCode="return Ok(None);",
         exceptionCode='return Err(());',
         isDefinitelyObject=True)
+    assert not info.needsRooting
     template = info.template
 
     jsConversion = string.Template(template).substitute({
@@ -4640,6 +4684,7 @@ class CGProxySpecialOperation(CGPerSignatureCall):
             info = getJSToNativeConversionInfo(
                 argument.type, descriptor, treatNullAs=argument.treatNullAs,
                 exceptionCode="return false;")
+            assert not info.needsRooting
             template = info.template
             declType = info.declType
 
@@ -5841,6 +5886,7 @@ class CGDictionary(CGThing):
                                          defaultValue=member.defaultValue,
                                          exceptionCode="return Err(());"))
             for member in dictionary.members]
+        assert not any(i.needsRooting for (_, i) in self.memberInfo)
 
     def define(self):
         if not self.generatable:
@@ -6460,6 +6506,7 @@ class CallbackMember(CGNativeMember):
             isCallbackReturnValue="Callback",
             # XXXbz we should try to do better here
             sourceDescription="return value")
+        assert not info.needsRooting
         template = info.template
         declType = info.declType
 

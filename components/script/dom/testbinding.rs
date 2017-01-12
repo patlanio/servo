@@ -36,6 +36,7 @@ use dom::url::URL;
 use js::jsapi::{HandleObject, HandleValue, JSContext, JSObject, JSAutoCompartment};
 use js::jsapi::{JS_NewPlainObject, JS_NewUint8ClampedArray};
 use js::jsval::{JSVal, NullValue};
+use js::typedarray::ArrayBuffer;
 use script_traits::MsDuration;
 use servo_config::prefs::PREFS;
 use std::borrow::ToOwned;
@@ -440,6 +441,7 @@ impl TestBindingMethods for TestBinding {
     unsafe fn PassAny(&self, _: *mut JSContext, _: HandleValue) {}
     #[allow(unsafe_code)]
     unsafe fn PassObject(&self, _: *mut JSContext, _: *mut JSObject) {}
+    fn PassArrayBuffer(&self, _: ArrayBuffer) {}
     fn PassCallbackFunction(&self, _: Rc<Function>) {}
     fn PassCallbackInterface(&self, _: Rc<EventListener>) {}
     fn PassSequence(&self, _: Vec<i32>) {}
